@@ -1,0 +1,24 @@
+# Data — never commit raw DICOMs or large zips
+data/raw/
+data/processed/
+
+# Model outputs and checkpoints
+outputs/runs/
+outputs/folds/
+outputs/yolo_dataset/
+*.pt
+*.onnx
+*.engine
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# Logs
+*.log
+nohup.out
+
+# OS
+.DS_Store
