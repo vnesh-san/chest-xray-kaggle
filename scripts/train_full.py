@@ -9,16 +9,10 @@ train_full.py — Full competition training pipeline.
     soft tissue (  80,  800)               vascular  ( 100,  700)
          ↓                                      ↓
   YOLO26x-A × 15 folds              YOLO26x-B × 15 folds
-  (ILD, cardiomegaly,                (calcification,
-   pneumothorax, infiltration,        pleural thickening,
-   lung opacity, nodule)              aortic enlargement)
+  RT-DETR-X-A × 15 folds            RT-DETR-X-B × 15 folds
          ↓                                      ↓
-                 RT-DETR-X-B × 15 folds
-                 (transformer on bone/pleural/vascular view —
-                  maximally different from YOLO26x-A)
-                        ↓
               WBF ensemble (iou_thr=0.4)
-              45 total checkpoints → submission
+              60 total checkpoints → submission
 
 Key design decisions:
   - No architecture changes: all models use standard 3-ch RGB input
@@ -44,14 +38,17 @@ Usage:
     # Stage 2: YOLO26x on window set B
     PYTHONPATH=. python scripts/train_full.py --stage 2 --window-set B
 
-    # Stage 3: RT-DETR-X on window set B
-    PYTHONPATH=. python scripts/train_full.py --stage 3 --window-set B
+    # Stage 3: RT-DETR-X on window set A
+    PYTHONPATH=. python scripts/train_full.py --stage 3 --window-set A
 
-    # Stage ensemble: WBF across all 45 checkpoints
+    # Stage 4: RT-DETR-X on window set B
+    PYTHONPATH=. python scripts/train_full.py --stage 4 --window-set B
+
+    # Stage ensemble: WBF across all 60 checkpoints
     PYTHONPATH=. python scripts/train_full.py --stage ensemble
 
     # Or run everything sequentially:
-    PYTHONPATH=. python scripts/train_full.py --stage all --window-set both
+    PYTHONPATH=. python scripts/train_full.py --stage all
 
     # Resume from a specific fold:
     PYTHONPATH=. python scripts/train_full.py --stage 1 --window-set A --start-fold 4
@@ -97,9 +94,10 @@ CLASS_NAMES = [
 ]
 NC = len(CLASS_NAMES)
 
-STAGE1_MODEL = "yolo26x.pt"    # window set A
-STAGE2_MODEL = "yolo26x.pt"    # window set B
-STAGE3_MODEL = "rtdetr-x.pt"   # window set B (transformer, max diversity)
+STAGE1_MODEL = "yolo26x.pt"    # YOLO26x window set A
+STAGE2_MODEL = "yolo26x.pt"    # YOLO26x window set B
+STAGE3_MODEL = "rtdetr-x.pt"   # RT-DETR-X window set A
+STAGE4_MODEL = "rtdetr-x.pt"   # RT-DETR-X window set B
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -292,7 +290,7 @@ def _run_yolo_folds(model_name, window_set, stage_name, batch, start_fold, worke
     print(f"\n{stage_name} done. Mean mAP50={df['map50'].mean():.4f}  → {out}")
 
 
-def _run_rtdetr_folds(window_set, stage_name, batch, start_fold, workers):
+def _run_rtdetr_folds(model_name, window_set, stage_name, batch, start_fold, workers):
     from ultralytics import RTDETR
     device = 0 if torch.cuda.is_available() else "cpu"
     print(f"\n{'='*65}")
@@ -319,7 +317,7 @@ def _run_rtdetr_folds(window_set, stage_name, batch, start_fold, workers):
         yaml_path = write_fold_yaml(fold_num, img_ids[tr_idx], img_ids[va_idx], window_set)
         print(f"\n--- Fold {fold_num:02d}/{N_FOLDS} ---")
 
-        model = RTDETR(STAGE3_MODEL)
+        model = RTDETR(model_name)
         res = model.train(data=yaml_path,
                           project=str(RUNS_DIR / stage_name),
                           name=f"fold_{fold_num:02d}",
@@ -350,9 +348,14 @@ def stage2(batch, start_fold, workers):
     _run_yolo_folds(STAGE2_MODEL, "B", "stage2_yolo_B", batch, start_fold, workers)
 
 
-# ── Stage 3: RT-DETR-X Window Set B ───────────────────────────────────────────
+# ── Stage 3: RT-DETR-X Window Set A ───────────────────────────────────────────
 def stage3(batch, start_fold, workers):
-    _run_rtdetr_folds("B", "stage3_rtdetr_B", batch, start_fold, workers)
+    _run_rtdetr_folds(STAGE3_MODEL, "A", "stage3_rtdetr_A", batch, start_fold, workers)
+
+
+# ── Stage 4: RT-DETR-X Window Set B ───────────────────────────────────────────
+def stage4(batch, start_fold, workers):
+    _run_rtdetr_folds(STAGE4_MODEL, "B", "stage4_rtdetr_B", batch, start_fold, workers)
 
 
 # ── Stage convert: DICOM → PNG only (no training) ─────────────────────────────
@@ -364,7 +367,7 @@ def stage_convert(window_set: str, workers: int):
         convert_all_dicoms(all_ids, ws, workers)
 
 
-# ── Stage ensemble: WBF across all 45 checkpoints ────────────────────────────
+# ── Stage ensemble: WBF across all 60 checkpoints ────────────────────────────
 def stage_ensemble(conf: float, iou_thr: float, workers: int):
     from ensemble_boxes import weighted_boxes_fusion
     from ultralytics import YOLO, RTDETR
@@ -392,9 +395,10 @@ def stage_ensemble(conf: float, iou_thr: float, workers: int):
 
     # Gather all checkpoints + metadata
     stage_configs = [
-        ("stage1_yolo_A", "A", YOLO),
-        ("stage2_yolo_B", "B", YOLO),
-        ("stage3_rtdetr_B", "B", RTDETR),
+        ("stage1_yolo_A",   "A", YOLO),
+        ("stage2_yolo_B",   "B", YOLO),
+        ("stage3_rtdetr_A", "A", RTDETR),
+        ("stage4_rtdetr_B", "B", RTDETR),
     ]
 
     all_ckpts = []   # list of (ckpt_path, window_set, ModelClass, weight)
@@ -415,7 +419,7 @@ def stage_ensemble(conf: float, iou_thr: float, workers: int):
             all_ckpts.append((ckpt, ws, ModelClass, weight))
 
     if not all_ckpts:
-        sys.exit("No checkpoints found. Run stages 1, 2, 3 first.")
+        sys.exit("No checkpoints found. Run stages 1, 2, 3, 4 first.")
     print(f"Ensemble: {len(all_ckpts)} checkpoints  "
           f"({sum(1 for _,ws,_,_ in all_ckpts if ws=='A')} set-A, "
           f"{sum(1 for _,ws,_,_ in all_ckpts if ws=='B')} set-B)")
@@ -479,7 +483,7 @@ def stage_ensemble(conf: float, iou_thr: float, workers: int):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stage", type=str, default="1",
-                    choices=["convert", "1", "2", "3", "ensemble", "all"])
+                    choices=["convert", "1", "2", "3", "4", "ensemble", "all"])
     ap.add_argument("--window-set", type=str, default="A",
                     choices=["A", "B", "both"],
                     help="Window set to use (A=lung/mediastinum/softtissue, "
@@ -499,13 +503,16 @@ def main():
         stage2(args.batch, args.start_fold, args.workers)
     elif args.stage == "3":
         stage3(args.batch, args.start_fold, args.workers)
+    elif args.stage == "4":
+        stage4(args.batch, args.start_fold, args.workers)
     elif args.stage == "ensemble":
         stage_ensemble(args.conf, args.iou_thr, args.workers)
     elif args.stage == "all":
-        stage_convert(args.window_set if args.window_set != "both" else "both", args.workers)
+        stage_convert("both", args.workers)
         stage1(args.batch, args.start_fold, args.workers)
         stage2(args.batch, args.start_fold, args.workers)
         stage3(args.batch, args.start_fold, args.workers)
+        stage4(args.batch, args.start_fold, args.workers)
         stage_ensemble(args.conf, args.iou_thr, args.workers)
 
 
