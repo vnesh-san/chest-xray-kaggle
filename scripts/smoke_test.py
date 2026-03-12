@@ -20,19 +20,19 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import pydicom
 import torch
 from PIL import Image
 from tqdm import tqdm
 from ultralytics import YOLO
 
 from src.data.dicom_utils import dicom_to_multiwindow_png
+from src.data.label_consensus import build_consensus_labels
 from src.data.yolo_dicom_dataset import DicomYOLOTrainer
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 ROOT_DIR   = Path("data/raw/vinbigdata-chest-xray-abnormalities-detection")
 WORK_DIR   = Path("outputs/smoke_test")
-IMG_SIZE   = 640
+IMG_SIZE   = 640   # keep 640 for fast smoke test; train_full.py uses 1024
 SEED       = 42
 
 CLASS_NAMES = [
@@ -109,34 +109,15 @@ def main():
     val_ids   = sample_ids[:val_n]
     print(f"Subset  : {len(train_ids)} train | {len(val_ids)} val")
 
-    # ── Build annotation lookup ────────────────────────────────────────────
-    findings = train_data[train_data["class_name"] != "No finding"]
-    dims = (
-        train_data.groupby("image_id")[["width", "height"]].first()
-        if {"width", "height"} <= set(train_data.columns) else None
-    )
+    # ── Build consensus annotation lookup (WBF merge, min_votes=2) ───────
+    print("Building consensus labels ...")
+    subset_data = train_data[train_data["image_id"].isin(sample_ids)]
+    anns_map = build_consensus_labels(subset_data, iou_thr=0.4, min_votes=2)
+    n_pos = sum(1 for v in anns_map.values() if v)
+    print(f"  {n_pos} positive images with consensus boxes out of {len(sample_ids)}")
 
     def get_anns(img_id):
-        rows = findings[findings["image_id"] == img_id]
-        if len(rows) == 0:
-            return []
-        if dims is not None and img_id in dims.index:
-            iw, ih = float(dims.loc[img_id, "width"]), float(dims.loc[img_id, "height"])
-        else:
-            ds = pydicom.dcmread(str(ROOT_DIR / "train" / f"{img_id}.dicom"))
-            ih, iw = ds.pixel_array.shape[:2]
-        anns = []
-        for _, r in rows.iterrows():
-            cid = CLASS2ID.get(r["class_name"])
-            if cid is None:
-                continue
-            x1, y1, x2, y2 = float(r.x_min), float(r.y_min), float(r.x_max), float(r.y_max)
-            xc = (x1 + x2) / 2 / iw
-            yc = (y1 + y2) / 2 / ih
-            bw = (x2 - x1) / iw
-            bh = (y2 - y1) / ih
-            anns.append((cid, *[max(0., min(1., v)) for v in [xc, yc, bw, bh]]))
-        return anns
+        return anns_map.get(img_id, [])
 
     # ── DICOM → PNG + labels ───────────────────────────────────────────────
     imgs_dir   = WORK_DIR / "images"
@@ -220,6 +201,8 @@ def main():
         seed         = SEED,
         close_mosaic = 0,   # skip warm-up mosaic-close for 1-epoch test
         cache        = False,
+        hsv_s        = 0.2, # reduced from 0.7 — safe for Hounsfield window encoding
+        flipud       = 0.0, # vertical flip breaks chest anatomy
     )
     trainer = DicomYOLOTrainer(
         dicom_root = ROOT_DIR / "train",
