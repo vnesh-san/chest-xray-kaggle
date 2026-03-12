@@ -1,14 +1,20 @@
 """
 dicom_utils.py — DICOM → multi-window 3-channel PNG conversion.
 
-Gold standard for chest X-ray competitions:
-  R = lung window        (WC=-600, WW=1500)  — pneumothorax, ILD, infiltration
-  G = mediastinum window (WC=40,   WW=400)   — cardiomegaly, effusion, aorta
-  B = soft tissue window (WC=80,   WW=800)   — nodules, calcification, mass
+Two complementary 3-channel window sets for dual-YOLO ensemble strategy:
 
-Each channel is an independent 8-bit windowed view of the full 12/16-bit DICOM.
-No dynamic range is lost — different tissue contrasts are captured per channel.
-Works natively with ultralytics YOLO / RT-DETR (standard uint8 RGB PNG).
+  Window Set A (general anatomy):
+    R = lung window        (WC=-600, WW=1500)  — pneumothorax, ILD, infiltration, atelectasis
+    G = mediastinum window (WC= 40,  WW= 400)  — cardiomegaly, effusion, aorta
+    B = soft tissue window (WC= 80,  WW= 800)  — nodules, consolidation, lung opacity
+
+  Window Set B (specific pathologies):
+    R = bone window        (WC= 400, WW=1500)  — calcification (rare, needs bone contrast)
+    G = pleural window     (WC=  50, WW= 350)  — pleural thickening vs effusion distinction
+    B = vascular window    (WC= 100, WW= 700)  — aortic enlargement, pulmonary fibrosis
+
+Training two YOLO26x models on A and B (no architecture changes — both 3-ch RGB)
+then WBF-ensembling gives complementary detection coverage across all 14 classes.
 """
 from __future__ import annotations
 
@@ -21,18 +27,32 @@ from pydicom.pixel_data_handlers.util import apply_voi_lut
 
 # ── Window presets (center, width) ────────────────────────────────────────────
 WINDOW_PRESETS = {
-    "lung":        (-600, 1500),
-    "mediastinum": (  40,  400),
-    "soft_tissue": (  80,  800),
-    "bone":        ( 400, 1800),
+    "lung":        (-600, 1500),   # parenchyma
+    "mediastinum": (  40,  400),   # heart / vessels
+    "soft_tissue": (  80,  800),   # nodules / masses
+    "bone":        ( 400, 1500),   # calcification / ribs
+    "pleural":     (  50,  350),   # pleural effusion / thickening
+    "vascular":    ( 100,  700),   # aorta / pulmonary vessels
 }
 
-# Default 3-channel stack used for training
-DEFAULT_WINDOWS = [
+# Window Set A — general anatomy (current default)
+WINDOW_SET_A = [
     WINDOW_PRESETS["lung"],
     WINDOW_PRESETS["mediastinum"],
     WINDOW_PRESETS["soft_tissue"],
 ]
+
+# Window Set B — specific pathologies (new)
+WINDOW_SET_B = [
+    WINDOW_PRESETS["bone"],
+    WINDOW_PRESETS["pleural"],
+    WINDOW_PRESETS["vascular"],
+]
+
+# Backward-compat alias
+DEFAULT_WINDOWS = WINDOW_SET_A
+
+WINDOW_SETS = {"A": WINDOW_SET_A, "B": WINDOW_SET_B}
 
 
 def _apply_window(pixels: np.ndarray, center: float, width: float) -> np.ndarray:
@@ -69,7 +89,9 @@ def dicom_to_multiwindow_png(
     """
     if windows is None:
         windows = DEFAULT_WINDOWS
-    assert len(windows) == 3, "Exactly 3 windows required for RGB output."
+    if isinstance(windows, str):
+        windows = WINDOW_SETS[windows]   # accept "A" or "B" directly
+    assert len(windows) == 3, "Exactly 3 windows required for RGB PNG output."
 
     ds = pydicom.dcmread(str(src))
 

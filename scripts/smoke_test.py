@@ -201,6 +201,7 @@ def main():
         seed         = SEED,
         close_mosaic = 0,   # skip warm-up mosaic-close for 1-epoch test
         cache        = False,
+        mosaic       = 0.0, # disable mosaic — buffer empty bug with end2end=True on small datasets
         hsv_s        = 0.2, # reduced from 0.7 — safe for Hounsfield window encoding
         flipud       = 0.0, # vertical flip breaks chest anatomy
     )
