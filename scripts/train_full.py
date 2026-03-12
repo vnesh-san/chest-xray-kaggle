@@ -100,6 +100,16 @@ STAGE3_MODEL = "rtdetr-x.pt"   # RT-DETR-X window set A
 STAGE4_MODEL = "rtdetr-x.pt"   # RT-DETR-X window set B
 
 
+def auto_device() -> str:
+    """Return '0,1' for 2 GPUs, '0' for 1 GPU, 'cpu' otherwise."""
+    n = torch.cuda.device_count()
+    if n >= 2:
+        return "0,1"
+    if n == 1:
+        return "0"
+    return "cpu"
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def images_dir(window_set: str) -> Path:
     return YOLO_DIR / f"images_{window_set}"
@@ -240,9 +250,10 @@ RTDETR_TRAIN_KWARGS = dict(
 
 # ── Stage runners ─────────────────────────────────────────────────────────────
 def _run_yolo_folds(model_name, window_set, stage_name, batch, start_fold, workers,
-                    extra_kwargs=None):
+                    device=None, extra_kwargs=None):
     from ultralytics import YOLO
-    device = 0 if torch.cuda.is_available() else "cpu"
+    if device is None:
+        device = auto_device()
     print(f"\n{'='*65}")
     print(f" {stage_name}  |  window set {window_set}  |  {N_FOLDS}-fold  |  {EPOCHS} epochs  |  {IMG_SIZE}px")
     print(f"{'='*65}\n")
@@ -290,9 +301,11 @@ def _run_yolo_folds(model_name, window_set, stage_name, batch, start_fold, worke
     print(f"\n{stage_name} done. Mean mAP50={df['map50'].mean():.4f}  → {out}")
 
 
-def _run_rtdetr_folds(model_name, window_set, stage_name, batch, start_fold, workers):
+def _run_rtdetr_folds(model_name, window_set, stage_name, batch, start_fold, workers,
+                      device=None):
     from ultralytics import RTDETR
-    device = 0 if torch.cuda.is_available() else "cpu"
+    if device is None:
+        device = auto_device()
     print(f"\n{'='*65}")
     print(f" {stage_name} (RT-DETR-X)  |  window set {window_set}  |  {N_FOLDS}-fold  |  {EPOCHS} epochs")
     print(f"{'='*65}\n")
@@ -339,23 +352,23 @@ def _run_rtdetr_folds(model_name, window_set, stage_name, batch, start_fold, wor
 
 
 # ── Stage 1: YOLO26x Window Set A ─────────────────────────────────────────────
-def stage1(batch, start_fold, workers):
-    _run_yolo_folds(STAGE1_MODEL, "A", "stage1_yolo_A", batch, start_fold, workers)
+def stage1(batch, start_fold, workers, device=None):
+    _run_yolo_folds(STAGE1_MODEL, "A", "stage1_yolo_A", batch, start_fold, workers, device=device)
 
 
 # ── Stage 2: YOLO26x Window Set B ─────────────────────────────────────────────
-def stage2(batch, start_fold, workers):
-    _run_yolo_folds(STAGE2_MODEL, "B", "stage2_yolo_B", batch, start_fold, workers)
+def stage2(batch, start_fold, workers, device=None):
+    _run_yolo_folds(STAGE2_MODEL, "B", "stage2_yolo_B", batch, start_fold, workers, device=device)
 
 
 # ── Stage 3: RT-DETR-X Window Set A ───────────────────────────────────────────
-def stage3(batch, start_fold, workers):
-    _run_rtdetr_folds(STAGE3_MODEL, "A", "stage3_rtdetr_A", batch, start_fold, workers)
+def stage3(batch, start_fold, workers, device=None):
+    _run_rtdetr_folds(STAGE3_MODEL, "A", "stage3_rtdetr_A", batch, start_fold, workers, device=device)
 
 
 # ── Stage 4: RT-DETR-X Window Set B ───────────────────────────────────────────
-def stage4(batch, start_fold, workers):
-    _run_rtdetr_folds(STAGE4_MODEL, "B", "stage4_rtdetr_B", batch, start_fold, workers)
+def stage4(batch, start_fold, workers, device=None):
+    _run_rtdetr_folds(STAGE4_MODEL, "B", "stage4_rtdetr_B", batch, start_fold, workers, device=device)
 
 
 # ── Stage convert: DICOM → PNG only (no training) ─────────────────────────────
@@ -368,11 +381,12 @@ def stage_convert(window_set: str, workers: int):
 
 
 # ── Stage ensemble: WBF across all 60 checkpoints ────────────────────────────
-def stage_ensemble(conf: float, iou_thr: float, workers: int):
+def stage_ensemble(conf: float, iou_thr: float, workers: int, device=None):
     from ensemble_boxes import weighted_boxes_fusion
     from ultralytics import YOLO, RTDETR
 
-    device   = 0 if torch.cuda.is_available() else "cpu"
+    if device is None:
+        device = auto_device()
     test_dir = ROOT_DIR / "test"
 
     # Convert test DICOMs for both window sets
@@ -488,32 +502,37 @@ def main():
                     choices=["A", "B", "both"],
                     help="Window set to use (A=lung/mediastinum/softtissue, "
                          "B=bone/pleural/vascular, both=run all)")
-    ap.add_argument("--batch",      type=int,   default=4)
+    ap.add_argument("--batch",      type=int,   default=8,
+                    help="Total batch size across all GPUs (default 8 = 4 per GPU on 2×A10G)")
     ap.add_argument("--start-fold", type=int,   default=1)
     ap.add_argument("--workers",    type=int,   default=8)
     ap.add_argument("--conf",       type=float, default=0.25)
     ap.add_argument("--iou-thr",    type=float, default=0.4)
+    ap.add_argument("--device",     type=str,   default=None,
+                    help="Device override: '0', '0,1', 'cpu'. Default: auto-detect.")
     args = ap.parse_args()
+
+    dev = args.device  # None → auto_device() is called inside each stage
 
     if args.stage == "convert":
         stage_convert(args.window_set, args.workers)
     elif args.stage == "1":
-        stage1(args.batch, args.start_fold, args.workers)
+        stage1(args.batch, args.start_fold, args.workers, device=dev)
     elif args.stage == "2":
-        stage2(args.batch, args.start_fold, args.workers)
+        stage2(args.batch, args.start_fold, args.workers, device=dev)
     elif args.stage == "3":
-        stage3(args.batch, args.start_fold, args.workers)
+        stage3(args.batch, args.start_fold, args.workers, device=dev)
     elif args.stage == "4":
-        stage4(args.batch, args.start_fold, args.workers)
+        stage4(args.batch, args.start_fold, args.workers, device=dev)
     elif args.stage == "ensemble":
-        stage_ensemble(args.conf, args.iou_thr, args.workers)
+        stage_ensemble(args.conf, args.iou_thr, args.workers, device=dev)
     elif args.stage == "all":
         stage_convert("both", args.workers)
-        stage1(args.batch, args.start_fold, args.workers)
-        stage2(args.batch, args.start_fold, args.workers)
-        stage3(args.batch, args.start_fold, args.workers)
-        stage4(args.batch, args.start_fold, args.workers)
-        stage_ensemble(args.conf, args.iou_thr, args.workers)
+        stage1(args.batch, args.start_fold, args.workers, device=dev)
+        stage2(args.batch, args.start_fold, args.workers, device=dev)
+        stage3(args.batch, args.start_fold, args.workers, device=dev)
+        stage4(args.batch, args.start_fold, args.workers, device=dev)
+        stage_ensemble(args.conf, args.iou_thr, args.workers, device=dev)
 
 
 if __name__ == "__main__":
