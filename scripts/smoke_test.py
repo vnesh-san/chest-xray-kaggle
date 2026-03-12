@@ -23,9 +23,10 @@ import pandas as pd
 import pydicom
 import torch
 from PIL import Image
-from pydicom.pixel_data_handlers.util import apply_voi_lut
 from tqdm import tqdm
 from ultralytics import YOLO
+
+from src.data.dicom_utils import dicom_to_multiwindow_png
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 ROOT_DIR   = Path("data/raw/vinbigdata-chest-xray-abnormalities-detection")
@@ -46,19 +47,11 @@ NC       = len(CLASS_NAMES)
 
 # ── DICOM helpers ─────────────────────────────────────────────────────────────
 def dicom_to_png(src: Path, dst: Path) -> tuple[int, int]:
-    """Convert one DICOM to an 8-bit RGB PNG. Returns (w, h)."""
-    ds = pydicom.dcmread(str(src))
-    try:
-        data = apply_voi_lut(ds.pixel_array.astype("float32"), ds)
-    except Exception:
-        data = ds.pixel_array.astype("float32")
-    if getattr(ds, "PhotometricInterpretation", "") == "MONOCHROME1":
-        data = data.max() - data
-    lo, hi = data.min(), data.max()
-    data = ((data - lo) / (hi - lo + 1e-8) * 255).astype("uint8")
-    img = Image.fromarray(data).convert("RGB")
-    img.save(str(dst))
-    return img.size  # (w, h)
+    """
+    Convert one DICOM to a 3-channel multi-window PNG. Returns (w, h).
+    R=lung, G=mediastinum, B=soft-tissue — captures all clinically relevant contrast.
+    """
+    return dicom_to_multiwindow_png(src, dst)
 
 
 def write_yolo_label(path: Path, anns: list):

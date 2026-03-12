@@ -30,10 +30,11 @@ import pandas as pd
 import pydicom
 import torch
 from PIL import Image
-from pydicom.pixel_data_handlers.util import apply_voi_lut
 from sklearn.model_selection import StratifiedKFold
 from tqdm import tqdm
 from ultralytics import YOLO
+
+from src.data.dicom_utils import dicom_to_multiwindow_png
 
 # ── Config ────────────────────────────────────────────────────────────────────
 ROOT_DIR  = Path("data/raw/vinbigdata-chest-xray-abnormalities-detection")
@@ -67,16 +68,8 @@ STAGE2_MODEL = "rtdetr-x.pt"
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
 def dicom_to_png(src: Path, dst: Path):
-    ds = pydicom.dcmread(str(src))
-    try:
-        data = apply_voi_lut(ds.pixel_array.astype("float32"), ds)
-    except Exception:
-        data = ds.pixel_array.astype("float32")
-    if getattr(ds, "PhotometricInterpretation", "") == "MONOCHROME1":
-        data = data.max() - data
-    lo, hi = data.min(), data.max()
-    data = ((data - lo) / (hi - lo + 1e-8) * 255).astype("uint8")
-    Image.fromarray(data).convert("RGB").save(str(dst))
+    """Multi-window 3-channel PNG: R=lung, G=mediastinum, B=soft-tissue."""
+    dicom_to_multiwindow_png(src, dst)
 
 
 def write_yolo_label(path: Path, anns: list):
