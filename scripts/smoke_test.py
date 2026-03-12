@@ -27,6 +27,7 @@ from tqdm import tqdm
 from ultralytics import YOLO
 
 from src.data.dicom_utils import dicom_to_multiwindow_png
+from src.data.yolo_dicom_dataset import DicomYOLOTrainer
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 ROOT_DIR   = Path("data/raw/vinbigdata-chest-xray-abnormalities-detection")
@@ -195,10 +196,13 @@ def main():
             "names" : CLASS_NAMES,
         }, f, default_flow_style=False)
 
-    # ── Train ──────────────────────────────────────────────────────────────
+    # ── Train via DicomYOLOTrainer (native DICOM, no PNG needed) ──────────
     print(f"\nTraining {args.model} for {args.epochs} epoch(s) ...")
-    model = YOLO(args.model)
-    results = model.train(
+    print(f"  DICOM root : {ROOT_DIR / 'train'}")
+    print(f"  Windows    : lung / mediastinum / soft-tissue + CLAHE")
+
+    overrides = dict(
+        model        = args.model,
         data         = str(dataset_yaml),
         epochs       = args.epochs,
         imgsz        = IMG_SIZE,
@@ -217,9 +221,15 @@ def main():
         close_mosaic = 0,   # skip warm-up mosaic-close for 1-epoch test
         cache        = False,
     )
+    trainer = DicomYOLOTrainer(
+        dicom_root = ROOT_DIR / "train",
+        overrides  = overrides,
+    )
+    trainer.train()
+    results = trainer
 
     # ── Report ─────────────────────────────────────────────────────────────
-    rd = results.results_dict if hasattr(results, "results_dict") else {}
+    rd = trainer.metrics if hasattr(trainer, "metrics") else {}
     map50   = rd.get("metrics/mAP50(B)",    "n/a")
     map5095 = rd.get("metrics/mAP50-95(B)", "n/a")
     print("\n" + "=" * 50)
