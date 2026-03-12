@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 
 CLASS_NAMES = [
@@ -98,11 +99,126 @@ def _count_votes(
     return counts
 
 
+def _process_image_chunk(args) -> list[tuple[str, list]]:
+    """
+    Worker function: process a CHUNK of images in one process.
+    Much faster than per-image dispatch because it amortises process startup
+    and pickle overhead across many images.
+
+    args: (chunk, iou_thr, min_votes)
+    chunk: list of (img_id, img_findings_rows, iw, ih)
+    Returns: list of (img_id, anns_list)
+    """
+    chunk, iou_thr, min_votes = args
+    results = []
+    for img_id, img_findings_rows, iw, ih in chunk:
+        merged_anns = []
+        cls_groups: dict[str, list] = {}
+        for row in img_findings_rows:
+            cls_name, x_min, y_min, x_max, y_max = row
+            cls_groups.setdefault(cls_name, []).append((x_min, y_min, x_max, y_max))
+
+        for cls_name, coords in cls_groups.items():
+            cid = CLASS2ID.get(cls_name)
+            if cid is None:
+                continue
+            boxes_norm = []
+            for x_min, y_min, x_max, y_max in coords:
+                x1 = max(0.0, min(1.0, float(x_min) / iw))
+                y1 = max(0.0, min(1.0, float(y_min) / ih))
+                x2 = max(0.0, min(1.0, float(x_max) / iw))
+                y2 = max(0.0, min(1.0, float(y_max) / ih))
+                if x2 > x1 and y2 > y1:
+                    boxes_norm.append([x1, y1, x2, y2])
+            if not boxes_norm:
+                continue
+            merged_boxes, vote_counts = _wbf_single_class(boxes_norm, iou_thr)
+            for box, votes in zip(merged_boxes, vote_counts):
+                if votes < min_votes:
+                    continue
+                x1, y1, x2, y2 = box
+                xc = (x1 + x2) / 2
+                yc = (y1 + y2) / 2
+                bw = x2 - x1
+                bh = y2 - y1
+                merged_anns.append((cid, xc, yc, bw, bh))
+        results.append((img_id, merged_anns))
+    return results
+
+
+def build_dims_cache(
+    image_ids: list[str],
+    dicom_dir: str | None = None,
+    cache_path: str | None = "outputs/image_dims.json",
+    workers: int = 0,
+) -> dict[str, tuple[float, float]]:
+    """
+    Build a {image_id: (width, height)} cache by reading all DICOMs in parallel.
+    Saves to cache_path as JSON so subsequent runs skip DICOM reads entirely.
+
+    Parameters
+    ----------
+    image_ids  : list of image IDs to resolve
+    dicom_dir  : directory containing .dicom files
+                 (default: data/raw/vinbigdata.../train)
+    cache_path : where to save/load the JSON cache (None = no cache file)
+    workers    : threads for parallel DICOM reading (0 = cpu_count * 2 for I/O)
+    """
+    import json
+    import pydicom
+    import multiprocessing as mp
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from pathlib import Path
+
+    if dicom_dir is None:
+        dicom_dir = "data/raw/vinbigdata-chest-xray-abnormalities-detection/train"
+    dicom_dir = Path(dicom_dir)
+
+    # Load existing cache
+    dims: dict[str, tuple[float, float]] = {}
+    if cache_path and Path(cache_path).exists():
+        with open(cache_path) as f:
+            raw = json.load(f)
+        dims = {k: tuple(v) for k, v in raw.items()}
+
+    missing = [i for i in image_ids if i not in dims]
+    if not missing:
+        return dims
+
+    n_threads = workers if workers > 0 else min(64, (mp.cpu_count() or 1) * 4)
+    print(f"  Reading dims for {len(missing):,} DICOMs ({n_threads} threads) ...")
+
+    def _read_dim(img_id):
+        p = dicom_dir / f"{img_id}.dicom"
+        if not p.exists():
+            return img_id, (1.0, 1.0)
+        ds = pydicom.dcmread(str(p), stop_before_pixels=True)
+        rows = int(getattr(ds, "Rows", 0)) or 1
+        cols = int(getattr(ds, "Columns", 0)) or 1
+        return img_id, (float(cols), float(rows))  # (width, height)
+
+    with ThreadPoolExecutor(max_workers=n_threads) as ex:
+        futs = {ex.submit(_read_dim, i): i for i in missing}
+        for fut in tqdm(as_completed(futs), total=len(missing), desc="DICOM dims"):
+            img_id, wh = fut.result()
+            dims[img_id] = wh
+
+    if cache_path:
+        Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(cache_path, "w") as f:
+            json.dump(dims, f)
+        print(f"  Dims cached → {cache_path}")
+
+    return dims
+
+
 def build_consensus_labels(
     df: pd.DataFrame,
     iou_thr: float = 0.4,
     min_votes: int = 2,
     no_finding_strategy: str = "any",
+    workers: int = 0,
+    dims_cache_path: str | None = "outputs/image_dims.json",
 ) -> dict[str, list[tuple]]:
     """
     Build YOLO-format consensus annotations for all images.
@@ -114,9 +230,9 @@ def build_consensus_labels(
     min_votes     : minimum radiologist agreement to keep a box (default 2)
     no_finding_strategy:
         "any"  — if any radiologist marks no finding only, keep image as negative
-                 (conservative; default)
         "all"  — only mark as negative if ALL radiologists say no finding
         "majority" — majority of radiologists say no finding
+    workers       : number of parallel worker processes (0 = use all CPU cores)
 
     Returns
     -------
@@ -124,31 +240,28 @@ def build_consensus_labels(
                Empty list means "No finding" (negative image).
                Coordinates are normalized [0, 1].
     """
+    import multiprocessing as mp
+    if workers == 0:
+        workers = mp.cpu_count()
+
     anns_map: dict[str, list] = {}
     all_ids = df["image_id"].unique()
 
     findings = df[df["class_name"] != "No finding"].copy()
     no_find  = df[df["class_name"] == "No finding"].copy()
 
-    # Pre-extract image dimensions (from train.csv if available, else fallback)
+    # Get image dimensions: from train.csv cols if available, else parallel DICOM read
     has_dims = {"width", "height"} <= set(df.columns)
     if has_dims:
-        dims = df.groupby("image_id")[["width", "height"]].first()
+        _dims_df = df.groupby("image_id")[["width", "height"]].first()
+        dims = {img_id: (float(_dims_df.loc[img_id, "width"]), float(_dims_df.loc[img_id, "height"]))
+                for img_id in all_ids if img_id in _dims_df.index}
     else:
-        dims = None
+        dims = build_dims_cache(list(all_ids), workers=workers * 2,
+                                cache_path=dims_cache_path)
 
     def get_dims(img_id: str) -> tuple[float, float]:
-        if dims is not None and img_id in dims.index:
-            return float(dims.loc[img_id, "width"]), float(dims.loc[img_id, "height"])
-        # Fallback: read from DICOM (slow, avoid if possible)
-        import pydicom
-        from pathlib import Path
-        dcm_path = Path("data/raw/vinbigdata-chest-xray-abnormalities-detection/train") / f"{img_id}.dicom"
-        if dcm_path.exists():
-            ds = pydicom.dcmread(str(dcm_path))
-            ih, iw = ds.pixel_array.shape[:2]
-            return float(iw), float(ih)
-        return 1.0, 1.0  # shouldn't happen
+        return dims.get(img_id, (1.0, 1.0))
 
     # Build per-image radiologist vote counts for "No finding"
     nofind_votes: dict[str, int] = {}
@@ -158,9 +271,13 @@ def build_consensus_labels(
         nofind_votes[img_id] = no_find[no_find["image_id"] == img_id]["rad_id"].nunique() \
             if "rad_id" in df.columns else int((no_find["image_id"] == img_id).sum())
 
+    # Separate negative images (no WBF needed) from positive images
+    positive_ids = []
+    worker_args  = []
+
     for img_id in all_ids:
         img_findings = findings[findings["image_id"] == img_id]
-        n_rads = total_rads.get(img_id, 1)
+        n_rads   = total_rads.get(img_id, 1)
         n_nofind = nofind_votes.get(img_id, 0)
 
         # Decide if this image is a "No finding" negative
@@ -176,41 +293,32 @@ def build_consensus_labels(
             continue
 
         iw, ih = get_dims(img_id)
-        merged_anns = []
+        rows = [(r["class_name"], r["x_min"], r["y_min"], r["x_max"], r["y_max"])
+                for _, r in img_findings.iterrows()]
+        worker_args.append((img_id, rows, iw, ih))
+        positive_ids.append(img_id)
 
-        for cls_name, cls_grp in img_findings.groupby("class_name"):
-            cid = CLASS2ID.get(cls_name)
-            if cid is None:
-                continue
+    # Run WBF in parallel — chunk images across workers to minimise IPC overhead
+    if worker_args:
+        n_proc = min(workers, len(worker_args))
+        chunk_size = max(1, len(worker_args) // n_proc)
+        chunks = [
+            (worker_args[i : i + chunk_size], iou_thr, min_votes)
+            for i in range(0, len(worker_args), chunk_size)
+        ]
+        with mp.Pool(processes=n_proc) as pool:
+            for chunk_results in pool.imap_unordered(_process_image_chunk, chunks):
+                for img_id, anns in chunk_results:
+                    anns_map[img_id] = anns
 
-            # Build normalized xyxy boxes for this class
-            boxes_norm = []
-            for _, r in cls_grp.iterrows():
-                x1 = max(0.0, min(1.0, float(r["x_min"]) / iw))
-                y1 = max(0.0, min(1.0, float(r["y_min"]) / ih))
-                x2 = max(0.0, min(1.0, float(r["x_max"]) / iw))
-                y2 = max(0.0, min(1.0, float(r["y_max"]) / ih))
-                if x2 > x1 and y2 > y1:
-                    boxes_norm.append([x1, y1, x2, y2])
-
-            if not boxes_norm:
-                continue
-
-            merged_boxes, vote_counts = _wbf_single_class(boxes_norm, iou_thr)
-
-            for box, votes in zip(merged_boxes, vote_counts):
-                if votes < min_votes:
-                    continue
-                x1, y1, x2, y2 = box
-                xc = (x1 + x2) / 2
-                yc = (y1 + y2) / 2
-                bw = x2 - x1
-                bh = y2 - y1
-                merged_anns.append((cid, xc, yc, bw, bh))
-
-        anns_map[img_id] = merged_anns
+    # Remaining images that were never assigned
+    for img_id in all_ids:
+        if img_id not in anns_map:
+            anns_map[img_id] = []
 
     return anns_map
+
+
 
 
 def consensus_stats(anns_map: dict[str, list]) -> dict:

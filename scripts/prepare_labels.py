@@ -37,6 +37,8 @@ def main():
     ap.add_argument("--no-finding-strategy", type=str, default="any",
                     choices=["any", "majority", "all"],
                     help="How to determine 'No finding' images (default: any)")
+    ap.add_argument("--workers", type=int, default=0,
+                    help="Parallel worker processes for WBF (0 = all CPU cores)")
     ap.add_argument("--output-dir", type=Path, default=LABELS_DIR,
                     help="Where to write YOLO .txt label files")
     ap.add_argument("--dry-run", action="store_true",
@@ -52,11 +54,15 @@ def main():
     print(f"  {len(df):,} rows, {df['image_id'].nunique():,} unique images")
 
     print(f"\nBuilding consensus labels (min_votes={args.min_votes}, iou_thr={args.iou_thr}) ...")
+    import multiprocessing as mp
+    n_workers = args.workers if args.workers > 0 else mp.cpu_count()
+    print(f"  Using {n_workers} parallel workers")
     anns_map = build_consensus_labels(
         df,
         iou_thr=args.iou_thr,
         min_votes=args.min_votes,
         no_finding_strategy=args.no_finding_strategy,
+        workers=n_workers,
     )
 
     stats = consensus_stats(anns_map)
