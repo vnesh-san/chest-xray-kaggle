@@ -85,6 +85,11 @@ IMG_SIZE   = 1024
 EPOCHS     = 50
 SEED       = 42
 
+NO_FOLD_DIR = FOLD_DIR / "no_fold"
+
+# Classes with low prevalence that benefit most from oversampling
+RARE_CLASS_IDS = {1, 2, 4, 5, 12}  # Atelectasis, Calcification, Consolidation, ILD, Pneumothorax
+
 CLASS_NAMES = [
     "Aortic enlargement", "Atelectasis", "Calcification",
     "Cardiomegaly", "Consolidation", "ILD", "Infiltration",
@@ -176,6 +181,105 @@ def write_all_labels(all_ids, anns_map):
         write_yolo_label(LABELS_DIR / f"{img_id}.txt", anns_map.get(img_id, []))
 
 
+# ── Oversampling ───────────────────────────────────────────────────────────────
+def compute_oversample_ids(img_ids: list, anns_map: dict) -> list:
+    """Return augmented list of image IDs with rare-class images duplicated 2–3x.
+
+    Uses repeat-factor sampling: repeat_factor = sqrt(target / freq) where
+    target = median class frequency, clamped to [1, 3].  Each image's repeat
+    factor is the max over its classes.  Extra repetitions are deterministic
+    (seeded by hash of image_id) to stay idempotent across runs.
+    """
+    # Count per-class image frequencies (one count per image, not per box)
+    class_counts = np.zeros(NC, dtype=int)
+    for img_id in img_ids:
+        seen = set()
+        for (cid, *_) in anns_map.get(img_id, []):
+            if 0 <= cid < NC and cid not in seen:
+                class_counts[cid] += 1
+                seen.add(cid)
+
+    freq = class_counts.astype(float)
+    freq[freq == 0] = 1.0  # avoid div-by-zero for absent classes
+    positive_freqs = freq[freq > 1]
+    target = float(np.median(positive_freqs)) if len(positive_freqs) else 1.0
+
+    repeat_factors = np.sqrt(target / freq)
+    repeat_factors = np.clip(repeat_factors, 1.0, 3.0)
+
+    extra_ids = []
+    for img_id in img_ids:
+        classes = [cid for (cid, *_) in anns_map.get(img_id, []) if 0 <= cid < NC]
+        if not classes:
+            continue
+        rep = max(repeat_factors[c] for c in classes)
+        n_extra = int(rep) - 1  # original already included once
+        frac = rep - int(rep)
+        # Deterministic fractional extra: seeded by image_id hash
+        rng = np.random.RandomState(hash(img_id) & 0xFFFF)
+        if rng.random() < frac:
+            n_extra += 1
+        extra_ids.extend([img_id] * n_extra)
+
+    result = list(img_ids) + extra_ids
+    print(f"  Oversampling: {len(img_ids):,} → {len(result):,} train images "
+          f"(+{len(extra_ids):,} duplicates, target_freq={target:.0f})")
+    return result
+
+
+def write_no_fold_dataset(all_ids, anns_map, window_set: str, oversample: bool = True) -> str:
+    """Create a 95/5 stratified train/val split on all images (no CV folds).
+
+    Writes symlinks + labels into NO_FOLD_DIR/<window_set>/.  Idempotent.
+    Duplicate images from oversampling get _dup2/_dup3 filename suffixes.
+    Returns the path to the dataset YAML.
+    """
+    from sklearn.model_selection import train_test_split
+
+    has_finding = np.array([1 if anns_map.get(i) else 0 for i in all_ids])
+    train_ids_base, val_ids = train_test_split(
+        list(all_ids), test_size=0.05, random_state=SEED, stratify=has_finding,
+    )
+    print(f"  No-fold split: {len(train_ids_base):,} train + {len(val_ids):,} val "
+          f"(stratified, seed={SEED})")
+
+    train_ids = compute_oversample_ids(train_ids_base, anns_map) if oversample else train_ids_base
+
+    fp = NO_FOLD_DIR / window_set
+    img_dir = images_dir(window_set)
+
+    for split, ids in [("train", train_ids), ("val", val_ids)]:
+        si = fp / split / "images"
+        sl = fp / split / "labels"
+        si.mkdir(parents=True, exist_ok=True)
+        sl.mkdir(parents=True, exist_ok=True)
+
+        seen_counts: dict = {}
+        for img_id in ids:
+            count = seen_counts.get(img_id, 0)
+            seen_counts[img_id] = count + 1
+
+            link_name = img_id if count == 0 else f"{img_id}_dup{count + 1}"
+
+            src_i = img_dir    / f"{img_id}.png"
+            src_l = LABELS_DIR / f"{img_id}.txt"
+            dst_i = si / f"{link_name}.png"
+            dst_l = sl / f"{link_name}.txt"
+
+            if not dst_i.exists() and src_i.exists():
+                os.symlink(src_i.resolve(), dst_i)
+            if not dst_l.exists():
+                shutil.copy2(src_l, dst_l) if src_l.exists() else open(dst_l, "w").close()
+
+    yaml_path = fp / "dataset.yaml"
+    with open(yaml_path, "w") as f:
+        yaml.dump({"path": str(fp.resolve()), "train": "train/images",
+                   "val": "val/images", "nc": NC, "names": CLASS_NAMES},
+                  f, default_flow_style=False)
+    print(f"  Dataset YAML: {yaml_path}")
+    return str(yaml_path)
+
+
 # ── Fold structure ────────────────────────────────────────────────────────────
 def write_fold_yaml(fold_num: int, train_ids, val_ids, window_set: str) -> str:
     fp = fold_dir(fold_num, window_set)
@@ -227,24 +331,24 @@ YOLO_TRAIN_KWARGS = dict(
     epochs=EPOCHS, imgsz=IMG_SIZE, optimizer="MuSGD", end2end=True,
     amp=True, workers=8,
     lr0=0.01, lrf=0.01, momentum=0.937, weight_decay=0.0005,
-    warmup_epochs=3.0, box=7.5, cls=1.0,
+    warmup_epochs=1.0, box=7.5, cls=1.0,
     hsv_h=0.015, hsv_s=0.2, hsv_v=0.4,   # hsv_s=0.2 safe for HU encoding
     flipud=0.0, fliplr=0.5,               # no vertical flip — breaks chest anatomy
     mosaic=1.0, translate=0.1, scale=0.5,
-    close_mosaic=10, plots=True, verbose=True,
-    save=True, save_period=10, val=True, cache=False,
+    close_mosaic=5, mixup=0.1, plots=True, verbose=True,
+    save=True, save_period=10, val=True, cache="ram", patience=0,
 )
 
 RTDETR_TRAIN_KWARGS = dict(
     epochs=EPOCHS, imgsz=IMG_SIZE, optimizer="AdamW",
     amp=True, workers=8,
-    lr0=1e-4, weight_decay=0.0001, warmup_epochs=2.0,
+    lr0=1e-4, weight_decay=0.0001, warmup_epochs=1.0,
     box=7.5, cls=1.0,
     hsv_h=0.015, hsv_s=0.2, hsv_v=0.4,
     flipud=0.0, fliplr=0.5,
     mosaic=0.5, translate=0.1, scale=0.5,
-    close_mosaic=5, plots=True, verbose=True,
-    save=True, save_period=10, val=True, cache=False,
+    close_mosaic=5, mixup=0.1, plots=True, verbose=True,
+    save=True, save_period=10, val=True, cache="ram", patience=0,
 )
 
 
@@ -254,6 +358,11 @@ def _run_yolo_folds(model_name, window_set, stage_name, batch, start_fold, worke
     from ultralytics import YOLO
     if device is None:
         device = auto_device()
+    # /dev/shm is only 62 MB on this machine; DDP spawns workers per rank so
+    # cap to 2 workers per rank in multi-GPU mode to avoid ENOMEM on semaphores.
+    if isinstance(device, str) and "," in device:
+        workers = min(workers, 2)
+        print(f"DDP mode detected — capping dataloader workers to {workers} (shm limit)")
     print(f"\n{'='*65}")
     print(f" {stage_name}  |  window set {window_set}  |  {N_FOLDS}-fold  |  {EPOCHS} epochs  |  {IMG_SIZE}px")
     print(f"{'='*65}\n")
@@ -306,6 +415,9 @@ def _run_rtdetr_folds(model_name, window_set, stage_name, batch, start_fold, wor
     from ultralytics import RTDETR
     if device is None:
         device = auto_device()
+    if isinstance(device, str) and "," in device:
+        workers = min(workers, 2)
+        print(f"DDP mode detected — capping dataloader workers to {workers} (shm limit)")
     print(f"\n{'='*65}")
     print(f" {stage_name} (RT-DETR-X)  |  window set {window_set}  |  {N_FOLDS}-fold  |  {EPOCHS} epochs")
     print(f"{'='*65}\n")
@@ -351,24 +463,117 @@ def _run_rtdetr_folds(model_name, window_set, stage_name, batch, start_fold, wor
     print(f"\n{stage_name} done. Mean mAP50={df['map50'].mean():.4f}  → {out}")
 
 
+# ── No-fold stage runners (single-GPU, full-data) ────────────────────────────
+def _run_yolo_no_folds(model_name, window_set, stage_name, batch, workers,
+                       device=None, extra_kwargs=None):
+    from ultralytics import YOLO
+    if device is None:
+        device = auto_device()
+    print(f"\n{'='*65}")
+    print(f" {stage_name}  |  window set {window_set}  |  NO-FOLDS (full data)  |  {EPOCHS} epochs  |  {IMG_SIZE}px")
+    print(f"  device={device}  batch={batch}  workers={workers}")
+    print(f"{'='*65}\n")
+
+    train_data = pd.read_csv(ROOT_DIR / "train.csv")
+    all_ids    = train_data["image_id"].unique()
+    anns_map   = load_consensus_annotations(train_data, workers)
+
+    convert_all_dicoms(all_ids, window_set, workers)
+    write_all_labels(all_ids, anns_map)
+
+    yaml_path = write_no_fold_dataset(all_ids, anns_map, window_set, oversample=True)
+
+    kwargs = {**YOLO_TRAIN_KWARGS, "batch": batch, "device": device,
+              "workers": workers, **(extra_kwargs or {})}
+
+    model = YOLO(model_name)
+    res = model.train(data=yaml_path,
+                      project=str(RUNS_DIR / stage_name),
+                      name="full",
+                      exist_ok=True, seed=SEED, **kwargs)
+    rd      = res.results_dict if hasattr(res, "results_dict") else {}
+    map50   = rd.get("metrics/mAP50(B)", None)
+    map5095 = rd.get("metrics/mAP50-95(B)", None)
+    best_pt = str(RUNS_DIR / stage_name / "full" / "weights" / "best.pt")
+    print(f"\n{stage_name} (no-fold) → mAP50={map50}  mAP50-95={map5095}")
+    print(f"  Best checkpoint: {best_pt}")
+
+    df = pd.DataFrame([{"fold": "full", "map50": map50, "map50_95": map5095,
+                        "window_set": window_set, "best": best_pt}])
+    df.to_csv(WORK_DIR / f"{stage_name}_results.csv", index=False)
+    gc.collect()
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+
+def _run_rtdetr_no_folds(model_name, window_set, stage_name, batch, workers, device=None):
+    from ultralytics import RTDETR
+    if device is None:
+        device = auto_device()
+    print(f"\n{'='*65}")
+    print(f" {stage_name} (RT-DETR-X)  |  window set {window_set}  |  NO-FOLDS (full data)  |  {EPOCHS} epochs")
+    print(f"  device={device}  batch={batch}  workers={workers}")
+    print(f"{'='*65}\n")
+
+    train_data = pd.read_csv(ROOT_DIR / "train.csv")
+    all_ids    = train_data["image_id"].unique()
+    anns_map   = load_consensus_annotations(train_data, workers)
+
+    convert_all_dicoms(all_ids, window_set, workers)
+    write_all_labels(all_ids, anns_map)
+
+    yaml_path = write_no_fold_dataset(all_ids, anns_map, window_set, oversample=True)
+
+    kwargs = {**RTDETR_TRAIN_KWARGS, "batch": batch, "device": device, "workers": workers}
+
+    model = RTDETR(model_name)
+    res = model.train(data=yaml_path,
+                      project=str(RUNS_DIR / stage_name),
+                      name="full",
+                      exist_ok=True, seed=SEED, **kwargs)
+    rd      = res.results_dict if hasattr(res, "results_dict") else {}
+    map50   = rd.get("metrics/mAP50(B)", None)
+    map5095 = rd.get("metrics/mAP50-95(B)", None)
+    best_pt = str(RUNS_DIR / stage_name / "full" / "weights" / "best.pt")
+    print(f"\n{stage_name} (no-fold) → mAP50={map50}  mAP50-95={map5095}")
+    print(f"  Best checkpoint: {best_pt}")
+
+    df = pd.DataFrame([{"fold": "full", "map50": map50, "map50_95": map5095,
+                        "window_set": window_set, "best": best_pt}])
+    df.to_csv(WORK_DIR / f"{stage_name}_results.csv", index=False)
+    gc.collect()
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+
 # ── Stage 1: YOLO26x Window Set A ─────────────────────────────────────────────
-def stage1(batch, start_fold, workers, device=None):
-    _run_yolo_folds(STAGE1_MODEL, "A", "stage1_yolo_A", batch, start_fold, workers, device=device)
+def stage1(batch, start_fold, workers, device=None, no_folds=False):
+    if no_folds:
+        _run_yolo_no_folds(STAGE1_MODEL, "A", "stage1_yolo_A", batch, workers, device=device)
+    else:
+        _run_yolo_folds(STAGE1_MODEL, "A", "stage1_yolo_A", batch, start_fold, workers, device=device)
 
 
 # ── Stage 2: YOLO26x Window Set B ─────────────────────────────────────────────
-def stage2(batch, start_fold, workers, device=None):
-    _run_yolo_folds(STAGE2_MODEL, "B", "stage2_yolo_B", batch, start_fold, workers, device=device)
+def stage2(batch, start_fold, workers, device=None, no_folds=False):
+    if no_folds:
+        _run_yolo_no_folds(STAGE2_MODEL, "B", "stage2_yolo_B", batch, workers, device=device)
+    else:
+        _run_yolo_folds(STAGE2_MODEL, "B", "stage2_yolo_B", batch, start_fold, workers, device=device)
 
 
 # ── Stage 3: RT-DETR-X Window Set A ───────────────────────────────────────────
-def stage3(batch, start_fold, workers, device=None):
-    _run_rtdetr_folds(STAGE3_MODEL, "A", "stage3_rtdetr_A", batch, start_fold, workers, device=device)
+def stage3(batch, start_fold, workers, device=None, no_folds=False):
+    if no_folds:
+        _run_rtdetr_no_folds(STAGE3_MODEL, "A", "stage3_rtdetr_A", batch, workers, device=device)
+    else:
+        _run_rtdetr_folds(STAGE3_MODEL, "A", "stage3_rtdetr_A", batch, start_fold, workers, device=device)
 
 
 # ── Stage 4: RT-DETR-X Window Set B ───────────────────────────────────────────
-def stage4(batch, start_fold, workers, device=None):
-    _run_rtdetr_folds(STAGE4_MODEL, "B", "stage4_rtdetr_B", batch, start_fold, workers, device=device)
+def stage4(batch, start_fold, workers, device=None, no_folds=False):
+    if no_folds:
+        _run_rtdetr_no_folds(STAGE4_MODEL, "B", "stage4_rtdetr_B", batch, workers, device=device)
+    else:
+        _run_rtdetr_folds(STAGE4_MODEL, "B", "stage4_rtdetr_B", batch, start_fold, workers, device=device)
 
 
 # ── Stage convert: DICOM → PNG only (no training) ─────────────────────────────
@@ -418,18 +623,34 @@ def stage_ensemble(conf: float, iou_thr: float, workers: int, device=None):
     all_ckpts = []   # list of (ckpt_path, window_set, ModelClass, weight)
     for stage_name, ws, ModelClass in stage_configs:
         csv_path = WORK_DIR / f"{stage_name}_results.csv"
-        ckpts = sorted((RUNS_DIR / stage_name).glob("fold_*/weights/best.pt"))
-        for ckpt in ckpts:
+        csv_df = None
+        if csv_path.exists():
+            try:
+                csv_df = pd.read_csv(csv_path)
+            except Exception:
+                pass
+
+        # Fold-CV checkpoints
+        for ckpt in sorted((RUNS_DIR / stage_name).glob("fold_*/weights/best.pt")):
             fold_num = int(ckpt.parent.parent.name.split("_")[1])
             weight = 1.0
-            if csv_path.exists():
-                try:
-                    df = pd.read_csv(csv_path)
-                    row = df[df["fold"] == fold_num]
-                    if len(row) and pd.notna(row.iloc[0]["map50"]):
-                        weight = float(row.iloc[0]["map50"])
-                except Exception:
-                    pass
+            if csv_df is not None:
+                row = csv_df[csv_df["fold"] == fold_num]
+                if len(row) and pd.notna(row.iloc[0]["map50"]):
+                    weight = float(row.iloc[0]["map50"])
+            all_ckpts.append((ckpt, ws, ModelClass, weight))
+
+        # No-fold (full-data) checkpoints: best + periodic saves
+        no_fold_ckpts = (
+            sorted((RUNS_DIR / stage_name).glob("full/weights/best.pt")) +
+            sorted((RUNS_DIR / stage_name).glob("full/weights/epoch*.pt"))
+        )
+        for ckpt in no_fold_ckpts:
+            weight = 1.0
+            if csv_df is not None:
+                row = csv_df[csv_df["fold"] == "full"]
+                if len(row) and pd.notna(row.iloc[0]["map50"]):
+                    weight = float(row.iloc[0]["map50"])
             all_ckpts.append((ckpt, ws, ModelClass, weight))
 
     if not all_ckpts:
@@ -510,28 +731,33 @@ def main():
     ap.add_argument("--iou-thr",    type=float, default=0.4)
     ap.add_argument("--device",     type=str,   default=None,
                     help="Device override: '0', '0,1', 'cpu'. Default: auto-detect.")
+    ap.add_argument("--no-folds",   action="store_true",
+                    help="Full-data mode: skip CV folds, 95/5 stratified split with "
+                         "rare-class oversampling, single-GPU training. "
+                         "Use with --device 0 or --device 1 for 2-GPU parallel launch.")
     args = ap.parse_args()
 
     dev = args.device  # None → auto_device() is called inside each stage
+    nf  = args.no_folds
 
     if args.stage == "convert":
         stage_convert(args.window_set, args.workers)
     elif args.stage == "1":
-        stage1(args.batch, args.start_fold, args.workers, device=dev)
+        stage1(args.batch, args.start_fold, args.workers, device=dev, no_folds=nf)
     elif args.stage == "2":
-        stage2(args.batch, args.start_fold, args.workers, device=dev)
+        stage2(args.batch, args.start_fold, args.workers, device=dev, no_folds=nf)
     elif args.stage == "3":
-        stage3(args.batch, args.start_fold, args.workers, device=dev)
+        stage3(args.batch, args.start_fold, args.workers, device=dev, no_folds=nf)
     elif args.stage == "4":
-        stage4(args.batch, args.start_fold, args.workers, device=dev)
+        stage4(args.batch, args.start_fold, args.workers, device=dev, no_folds=nf)
     elif args.stage == "ensemble":
         stage_ensemble(args.conf, args.iou_thr, args.workers, device=dev)
     elif args.stage == "all":
         stage_convert("both", args.workers)
-        stage1(args.batch, args.start_fold, args.workers, device=dev)
-        stage2(args.batch, args.start_fold, args.workers, device=dev)
-        stage3(args.batch, args.start_fold, args.workers, device=dev)
-        stage4(args.batch, args.start_fold, args.workers, device=dev)
+        stage1(args.batch, args.start_fold, args.workers, device=dev, no_folds=nf)
+        stage2(args.batch, args.start_fold, args.workers, device=dev, no_folds=nf)
+        stage3(args.batch, args.start_fold, args.workers, device=dev, no_folds=nf)
+        stage4(args.batch, args.start_fold, args.workers, device=dev, no_folds=nf)
         stage_ensemble(args.conf, args.iou_thr, args.workers, device=dev)
 
 

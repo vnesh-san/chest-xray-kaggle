@@ -4,35 +4,50 @@
 
 - **2026-03-11** — Set up local training pipeline: fix notebook paths for local env, upgrade to YOLO26x, resume data download, push to GitHub. `completed`
 - **2026-03-11** — Full pipeline implementation: smoke test, consensus labels, 6-channel dual-YOLO + RT-DETR 60-checkpoint ensemble. `completed`
+- **2026-03-13** — 24h parallel training pipeline: no-folds full-data mode, 2-GPU parallel launch, rare-class oversampling, cache=ram. `completed`
 
 ---
 
 ## Current Work
 
-**Original request:** "RT-DETR on both images like yolo" — add RT-DETR-X training on both window sets (A and B), giving a 60-checkpoint ensemble: YOLO26x-A×15 + YOLO26x-B×15 + RT-DETR-X-A×15 + RT-DETR-X-B×15.
+**Original request:** 24-hour full-data parallel training pipeline. Competition deadline March 30. Need trained models by tomorrow. Key insight: instead of DDP (42-day estimate), run two independent single-GPU processes in parallel — GPU 0 trains window set A, GPU 1 trains window set B simultaneously. No folds, train on full 15k images.
 
-**Questions / Decisions:**
-- RT-DETR v2 not available in ultralytics (only v1 `rtdetr-x.pt`); RT-DETRv2 is HuggingFace-only. Decision: stay in ultralytics for uniform `.train()/.predict()` API.
-- Stage 3 = RT-DETR-X on window set A (lung/mediastinum/soft-tissue)
-- Stage 4 = RT-DETR-X on window set B (bone/pleural/vascular)
+**Key decisions:**
+- `--no-folds` flag: full-data 95/5 stratified split (14,250 train / 750 val) — no 15-fold CV
+- Single-GPU per process (no DDP, no /dev/shm issues, workers=8)
+- Rare-class oversampling: repeat-factor sampling (sqrt(median/freq), clamp [1,3]) for Atelectasis (1), Calcification (2), Consolidation (4), ILD (5), Pneumothorax (12)
+- `cache="ram"` — 349GB RAM available, dataset ~42GB, big dataloader speedup
+- `warmup_epochs=1.0` (from 3.0/2.0), `close_mosaic=5` (from 10), add `mixup=0.1`, `patience=0`
+- Ultralytics has no built-in class balancing → added oversampling via symlink duplication
+- Oversampling is deterministic (seeded by hash(img_id) & 0xFFFF) for idempotency
 
 **Changes made to `scripts/train_full.py`:**
-1. `_run_rtdetr_folds()` now accepts `model_name` as first arg (was hardcoded to `STAGE3_MODEL`)
-2. `stage3()` → RT-DETR-X on window set A (`stage3_rtdetr_A`)
-3. `stage4()` → RT-DETR-X on window set B (`stage4_rtdetr_B`) — new function
-4. `stage_ensemble()` `stage_configs` now has all 4 entries (was missing stage3_rtdetr_A and stage4_rtdetr_B)
-5. CLI `--stage` choices now include `"4"`
-6. `--stage all` now calls `stage_convert("both")`, stage1–4, then ensemble
+1. Added `NO_FOLD_DIR` and `RARE_CLASS_IDS` constants
+2. Updated `YOLO_TRAIN_KWARGS`: `cache="ram"`, `warmup_epochs=1.0`, `close_mosaic=5`, `mixup=0.1`, `patience=0`
+3. Updated `RTDETR_TRAIN_KWARGS`: same hyperparams
+4. Added `compute_oversample_ids(img_ids, anns_map)` — repeat-factor oversampling, returns augmented ID list
+5. Added `write_no_fold_dataset(all_ids, anns_map, window_set, oversample=True)` — 95/5 split with oversampling symlinks, returns YAML path
+6. Added `_run_yolo_no_folds()` and `_run_rtdetr_no_folds()` — single training run, saves to `full/weights/`
+7. Updated `stage1()–stage4()` to accept `no_folds=False` param, dispatch to no-fold runners when set
+8. Updated `stage_ensemble()` checkpoint gathering to also glob `full/weights/best.pt` + `full/weights/epoch*.pt`
+9. Added `--no-folds` CLI flag and `nf` dispatch variable
 
-**Final ensemble config (60 checkpoints):**
-| Stage | Model | Window Set | Folds |
-|-------|-------|------------|-------|
-| 1 | YOLO26x | A (lung/med/soft) | 15 |
-| 2 | YOLO26x | B (bone/pleural/vasc) | 15 |
-| 3 | RT-DETR-X | A (lung/med/soft) | 15 |
-| 4 | RT-DETR-X | B (bone/pleural/vasc) | 15 |
+**New file `scripts/run_24h.sh`:**
+- Phase 1: YOLO26x-A (GPU 0) || YOLO26x-B (GPU 1) in parallel via `wait`
+- Phase 2: RT-DETR-X-A (GPU 0) || RT-DETR-X-B (GPU 1) in parallel
+- Phase 3: WBF ensemble
+- Logs to `outputs/train_stage{1..4}.log` and `outputs/train_ensemble.log`
+- Usage: `bash scripts/run_24h.sh [--batch 8] [--workers 8]`
 
-**Status:** Implementation complete.
+**Timeline:**
+| Phase | GPU 0 | GPU 1 | Wall Time |
+|-------|-------|-------|-----------|
+| YOLO 50ep, cache=ram | Win A (15k imgs) | Win B (15k imgs) | ~10-11h |
+| RT-DETR 50ep, cache=ram | Win A | Win B | ~10-11h |
+| WBF Ensemble | Both | — | ~1h |
+| **Total** | | | **~22h** |
+
+**Status:** Implementation complete. Ready to dry-run: `PYTHONPATH=. python scripts/train_full.py --stage 1 --no-folds --device 0 --batch 8`
 
 ---
 
@@ -88,3 +103,22 @@
 7. `train_full.py` 4-stage 60-checkpoint pipeline (YOLO26x × 2 + RT-DETR-X × 2, window sets A+B, 15 folds each)
 
 **Outcome:** All files committed and pushed. Ready to begin Stage 1 training.
+
+### 2026-03-13 — 24h parallel training pipeline
+
+**Branch:** vignesh-santhalingam/aimo2026/grpo-more-traces
+**Request:** 24-hour full-data parallel training pipeline. Deadline March 30 (17 days). Need models by tomorrow.
+
+**Key insight:** DDP (both GPUs on one model) takes ~42 days for 4 stages × 15 folds × 50 epochs. Instead, run two independent single-GPU processes in parallel on the 2 window sets simultaneously. No folds — train on full 15k images.
+
+**Key decisions:**
+- `--no-folds` flag for full-data 95/5 stratified split (no 15-fold CV)
+- Rare-class oversampling via symlink duplication (Atelectasis, Calcification, Consolidation, ILD, Pneumothorax)
+- `cache="ram"` (349GB available, dataset ~42GB)
+- `warmup_epochs=1.0`, `close_mosaic=5`, `mixup=0.1`, `patience=0`
+
+**Files changed:**
+- `scripts/train_full.py` — all changes described in Current Work above
+- `scripts/run_24h.sh` — new orchestration script
+
+**Outcome:** Implementation complete.
